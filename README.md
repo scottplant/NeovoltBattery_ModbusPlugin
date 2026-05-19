@@ -114,7 +114,7 @@ For parallel/master-slave setups enter the **total combined capacity**.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| **Min Poll Interval** | 10 s | Fastest polling rate (hard minimum 10 s) |
+| **Min Poll Interval** | 5 s | Fastest polling rate |
 | **Max Poll Interval** | 300 s | Slowest polling rate for stable values |
 | **Recovery: Consecutive Failures** | 5 | Auto-reconnect after this many failures |
 | **Recovery: Data Staleness** | 10 min | Auto-reconnect if no data changes |
