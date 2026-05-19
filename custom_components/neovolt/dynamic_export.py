@@ -29,6 +29,7 @@ from .const import (
     DYNAMIC_EXPORT_UPDATE_INTERVAL,
     DYNAMIC_EXPORT_SETTLE_SECONDS,
     DYNAMIC_EXPORT_MAX_STEP_KW,
+    DYNAMIC_MODE_FAST_POLL_INTERVAL,
     MODBUS_OFFSET,
     SOC_CONVERSION_FACTOR,
     MAX_SOC_REGISTER,
@@ -165,6 +166,13 @@ class DynamicExportManager:
         self._start_time = dt_util.now()
         self._duration_minutes = duration_minutes
 
+        # Pin grid and battery blocks to fast poll rate for the duration of this mode
+        self._coordinator.polling_manager.pin_block_interval("grid", DYNAMIC_MODE_FAST_POLL_INTERVAL)
+        self._coordinator.polling_manager.pin_block_interval("battery", DYNAMIC_MODE_FAST_POLL_INTERVAL)
+        _LOGGER.info(
+            f"Dynamic Export: pinned grid+battery blocks to {DYNAMIC_MODE_FAST_POLL_INTERVAL}s poll interval"
+        )
+
         # Start the control loop as a background task
         try:
             self._task = self._hass.async_create_task(self._control_loop())
@@ -181,6 +189,11 @@ class DynamicExportManager:
 
         _LOGGER.info("Stopping Dynamic Export mode")
         self._running = False
+
+        # Release the fast-poll pin so grid+battery return to adaptive control
+        self._coordinator.polling_manager.unpin_block_interval("grid")
+        self._coordinator.polling_manager.unpin_block_interval("battery")
+        _LOGGER.info("Dynamic Export: released grid+battery poll interval pins")
 
         if self._task:
             self._task.cancel()
@@ -622,6 +635,13 @@ class DynamicImportManager:
         self._start_time = dt_util.now()
         self._duration_minutes = duration_minutes
 
+        # Pin grid and battery blocks to fast poll rate for the duration of this mode
+        self._coordinator.polling_manager.pin_block_interval("grid", DYNAMIC_MODE_FAST_POLL_INTERVAL)
+        self._coordinator.polling_manager.pin_block_interval("battery", DYNAMIC_MODE_FAST_POLL_INTERVAL)
+        _LOGGER.info(
+            f"Dynamic Import: pinned grid+battery blocks to {DYNAMIC_MODE_FAST_POLL_INTERVAL}s poll interval"
+        )
+
         try:
             self._task = self._hass.async_create_task(self._control_loop())
             _LOGGER.info("Dynamic Import control loop task created successfully")
@@ -637,6 +657,11 @@ class DynamicImportManager:
 
         _LOGGER.info("Stopping Dynamic Import mode")
         self._running = False
+
+        # Release the fast-poll pin so grid+battery return to adaptive control
+        self._coordinator.polling_manager.unpin_block_interval("grid")
+        self._coordinator.polling_manager.unpin_block_interval("battery")
+        _LOGGER.info("Dynamic Import: released grid+battery poll interval pins")
 
         if self._task:
             self._task.cancel()

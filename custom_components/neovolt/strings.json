@@ -41,7 +41,7 @@
           "staleness_threshold": "Recovery: Data Staleness (minutes)"
         },
         "data_description": {
-          "min_poll_interval": "Fastest polling rate for active values (hard minimum: 10s)",
+          "min_poll_interval": "Fastest polling rate for active values (hard minimum: 5s)",
           "max_poll_interval": "Slowest polling rate for stable values",
           "consecutive_failure_threshold": "Trigger auto-recovery after this many consecutive poll failures",
           "staleness_threshold": "Trigger auto-recovery if data hasn't changed for this many minutes"
@@ -91,7 +91,7 @@
           "staleness_threshold": "Recovery: Data Staleness (minutes)"
         },
         "data_description": {
-          "min_poll_interval": "Fastest polling rate for active values (hard minimum: 10s)",
+          "min_poll_interval": "Fastest polling rate for active values (hard minimum: 5s)",
           "max_poll_interval": "Slowest polling rate for stable values",
           "consecutive_failure_threshold": "Trigger auto-recovery after this many consecutive poll failures",
           "staleness_threshold": "Trigger auto-recovery if data hasn't changed for this many minutes"

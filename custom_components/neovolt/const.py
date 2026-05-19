@@ -30,9 +30,10 @@ CONF_DYNAMIC_EXPORT_TARGET = "dynamic_export_target"
 DEFAULT_DYNAMIC_EXPORT_TARGET = 0.05  # 50W default — gentle trickle to stay on export side
 DYNAMIC_EXPORT_MIN_POWER = 0.05       # 50W minimum — allows zero-import bias correction
 DYNAMIC_EXPORT_MAX_POWER = 15.0  # 15kW max to support extended system configurations
-DYNAMIC_EXPORT_UPDATE_INTERVAL = 10  # seconds — control loop poll rate (do not raise)
-DYNAMIC_EXPORT_SETTLE_SECONDS = 30   # seconds to wait after a command before adjusting again
+DYNAMIC_EXPORT_UPDATE_INTERVAL = 5   # seconds — control loop poll rate, matches grid block pin interval
+DYNAMIC_EXPORT_SETTLE_SECONDS = 20   # seconds to wait after a command before adjusting again
 DYNAMIC_EXPORT_MAX_STEP_KW = 1.0     # kW — max power change per adjustment step
+DYNAMIC_MODE_FAST_POLL_INTERVAL = 5  # seconds — pinned poll rate for grid+battery blocks during dynamic modes
 
 # SOC (State of Charge) conversion constants
 # FIXED: According to Modbus protocol, dispatch SOC uses full 8-bit range (0-255)
@@ -82,7 +83,7 @@ CONF_CONSECUTIVE_FAILURE_THRESHOLD = "consecutive_failure_threshold"
 CONF_STALENESS_THRESHOLD = "staleness_threshold"
 
 # Polling defaults
-DEFAULT_MIN_POLL_INTERVAL = 10    # seconds (hard minimum)
+DEFAULT_MIN_POLL_INTERVAL = 5     # seconds (hard minimum — matches dynamic mode control loop)
 DEFAULT_MAX_POLL_INTERVAL = 300   # 5 minutes
 DEFAULT_POLL_INTERVAL = 30        # starting interval for all blocks
 DEFAULT_CONSECUTIVE_FAILURES = 5
@@ -90,7 +91,7 @@ DEFAULT_STALENESS_THRESHOLD = 10  # minutes
 RECOVERY_COOLDOWN_SECONDS = 60    # cooldown between recovery attempts
 
 # Hard limits for polling configuration
-MIN_POLL_INTERVAL_LIMIT = 10      # Cannot go below 10 seconds
+MIN_POLL_INTERVAL_LIMIT = 5       # Cannot go below 5 seconds
 MAX_POLL_INTERVAL_LIMIT = 3600    # Cannot exceed 1 hour
 
 # Keys for storing persistent data in config entry options

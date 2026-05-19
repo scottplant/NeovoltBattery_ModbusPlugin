@@ -72,13 +72,14 @@ class AdaptivePollingManager:
         default_interval: int = DEFAULT_POLL_INTERVAL,
     ):
         """Initialize the adaptive polling manager."""
-        self.min_interval = max(min_interval, 10)  # Hard cap at 10s minimum
+        self.min_interval = max(min_interval, 5)  # Hard cap at 5s minimum
         self.max_interval = max_interval
         self.default_interval = default_interval
         self.block_intervals: Dict[str, float] = {}
         self.block_last_poll: Dict[str, datetime] = {}
         self.block_last_values: Dict[str, Dict[str, Any]] = {}
         self.block_consecutive_failures: Dict[str, int] = {}
+        self._pinned_blocks: Dict[str, float] = {}  # block_name → pinned interval (seconds)
 
     def should_poll_block(self, block_name: str, now: datetime) -> bool:
         """Check if enough time has elapsed to poll this block."""
@@ -95,24 +96,57 @@ class AdaptivePollingManager:
         """
         Update interval based on whether values changed.
 
+        Pinned blocks bypass adaptive logic -- their interval is held fixed
+        for as long as they remain pinned (e.g. during dynamic dispatch modes).
+
         Returns True if values changed, False otherwise.
         """
         old_values = self.block_last_values.get(block_name, {})
         values_changed = new_values != old_values
 
-        current = self.block_intervals.get(block_name, self.default_interval)
-        if values_changed:
-            # Values changed → poll faster (10% decrease), cap at min
-            new_interval = max(current * 0.9, self.min_interval)
+        if block_name in self._pinned_blocks:
+            # Pinned -- hold the fixed interval, don't run the adaptive calculation
+            self.block_intervals[block_name] = self._pinned_blocks[block_name]
         else:
-            # No changes → poll slower (10% increase), cap at max
-            new_interval = min(current * 1.1, self.max_interval)
+            current = self.block_intervals.get(block_name, self.default_interval)
+            if values_changed:
+                # Values changed -- poll faster (10% decrease), cap at min
+                new_interval = max(current * 0.9, self.min_interval)
+            else:
+                # No changes -- poll slower (10% increase), cap at max
+                new_interval = min(current * 1.1, self.max_interval)
+            self.block_intervals[block_name] = new_interval
 
-        self.block_intervals[block_name] = new_interval
         self.block_last_poll[block_name] = now
         self.block_last_values[block_name] = new_values.copy()
 
         return values_changed
+
+    def pin_block_interval(self, block_name: str, interval: float) -> None:
+        """Pin a block to a fixed polling interval, bypassing adaptive logic.
+
+        Call this when a dynamic dispatch mode starts so that control-critical
+        blocks (grid, battery) are guaranteed to refresh at the required rate
+        regardless of how slowly the adaptive algorithm has wound them down.
+        """
+        self._pinned_blocks[block_name] = interval
+        self.block_intervals[block_name] = interval
+        _LOGGER.debug(f"Pinned block '{block_name}' to {interval}s poll interval")
+
+    def unpin_block_interval(self, block_name: str) -> None:
+        """Release a pinned block back to adaptive control.
+
+        The block's current interval is reset to default_interval so the
+        adaptive algorithm starts from a neutral baseline rather than the
+        (potentially very fast) pinned value.
+        """
+        if block_name in self._pinned_blocks:
+            del self._pinned_blocks[block_name]
+            self.block_intervals[block_name] = self.default_interval
+            _LOGGER.debug(
+                f"Unpinned block '{block_name}' -- returned to adaptive control "
+                f"(reset to {self.default_interval}s)"
+            )
 
     def get_cached_values(self, block_name: str) -> Dict[str, Any]:
         """Get cached values for a block that wasn't polled this cycle."""
@@ -778,7 +812,16 @@ class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
         # (97) as long as dispatch_start is still active and the cached mode
         # is still DISPATCH_MODE_NO_DISCHARGE, preventing the select and status
         # sensor from snapping back to "Normal" / "Dispatch Active" on each poll.
-        cached_mode = self.data.get("dispatch_mode") if self.data else None
+        #
+        # IMPORTANT: use self._last_known_data (the live internal cache) rather than
+        # self.data (the HA coordinator's publicly published data from the *previous*
+        # completed update cycle).  self._parse_dispatch_registers() runs inside
+        # _fetch_data_adaptive() which runs inside _async_update_data(); at that
+        # point self.data has NOT yet been updated with the current cycle's results,
+        # so it is always one cycle behind — and can be None on the very first poll
+        # after startup or a reconnection, causing the guard to miss and the Idle mode
+        # to revert to Normal.
+        cached_mode = self._last_known_data.get("dispatch_mode") if self._last_known_data else None
         no_discharge_active = (
             cached_mode == DISPATCH_MODE_NO_DISCHARGE
             and regs[0] == 1  # dispatch_start still active
