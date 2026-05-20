@@ -323,6 +323,7 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         self.coordinator.set_optimistic_value("dispatch_start", 0)
         self.coordinator.set_optimistic_value("dispatch_power", 0)
         self.coordinator.set_optimistic_value("dispatch_mode", 0)
+        self.coordinator.soc_watcher_disarm()
         await self.coordinator.async_request_refresh()
 
     async def _start_force_charge(self):
@@ -332,6 +333,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.dynamic_export_manager.stop()
         if hasattr(self.coordinator, 'dynamic_import_manager'):
             await self.coordinator.dynamic_import_manager.stop()
+        # Clear any prior intent (will be re-set at end of this method)
+        self.coordinator.soc_watcher_disarm()
 
         power, power_default, power_reason = safe_get_by_unique_id(
             self._hass,
@@ -372,7 +375,13 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             )
 
         power_watts = int(power * 1000)
-        soc_value = soc_percent_to_register(soc_target)
+
+        # Para5 is now the system safety ceiling only (from the inverter's own
+        # charging_cutoff_soc register), NOT the user's dispatch target.
+        # HA manages the stop via DispatchSocWatcher using the combined SOC.
+        # Fallback to 100% (register 255) if register not yet available.
+        safety_ceiling = self.coordinator.data.get("charging_cutoff_soc", 100) if self.coordinator.data else 100
+        soc_value = soc_percent_to_register(safety_ceiling)
 
         # CRITICAL FIX: Use FULL user-specified duration, not shortened timeout
         # User wants it to run for X minutes, so honor that request
@@ -404,6 +413,10 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         self.coordinator.set_optimistic_value("dispatch_start", 1)
         self.coordinator.set_optimistic_value("dispatch_power", -power_watts)
         self.coordinator.set_optimistic_value("dispatch_mode", DISPATCH_MODE_POWER_WITH_SOC)
+        # Persist the charge target and arm the SOC watcher
+        self.coordinator._dispatch_charge_soc = float(soc_target)
+        self.coordinator._save_persistent_data()
+        self.coordinator.soc_watcher_arm("charge")
         await self.coordinator.async_request_refresh()
 
     async def _start_force_discharge(self):
@@ -413,6 +426,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.dynamic_export_manager.stop()
         if hasattr(self.coordinator, 'dynamic_import_manager'):
             await self.coordinator.dynamic_import_manager.stop()
+        # Clear any prior intent (will be re-set at end of this method)
+        self.coordinator.soc_watcher_disarm()
 
         power, power_default, power_reason = safe_get_by_unique_id(
             self._hass,
@@ -453,7 +468,13 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             )
 
         power_watts = int(power * 1000)
-        soc_value = soc_percent_to_register(soc_cutoff)
+
+        # Para5 is now the system safety floor only (from the inverter's own
+        # discharging_cutoff_soc register), NOT the user's dispatch cutoff target.
+        # HA manages the stop via DispatchSocWatcher using the combined SOC.
+        # Fallback to 10% if register not yet available.
+        safety_floor = self.coordinator.data.get("discharging_cutoff_soc", 10) if self.coordinator.data else 10
+        soc_value = soc_percent_to_register(safety_floor)
 
         # CRITICAL FIX: Use FULL user-specified duration, not shortened timeout
         # User wants it to run for X minutes, so honor that request
@@ -485,6 +506,10 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         self.coordinator.set_optimistic_value("dispatch_start", 1)
         self.coordinator.set_optimistic_value("dispatch_power", power_watts)
         self.coordinator.set_optimistic_value("dispatch_mode", DISPATCH_MODE_POWER_WITH_SOC)
+        # Persist the discharge cutoff and arm the SOC watcher
+        self.coordinator._dispatch_discharge_soc = float(soc_cutoff)
+        self.coordinator._save_persistent_data()
+        self.coordinator.soc_watcher_arm("discharge")
         await self.coordinator.async_request_refresh()
 
     async def _start_dynamic_export(self):
@@ -494,6 +519,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         # Stop dynamic import if running
         if hasattr(self.coordinator, 'dynamic_import_manager'):
             await self.coordinator.dynamic_import_manager.stop()
+        # Clear any force charge/discharge intent — dynamic modes manage their own SOC guards
+        self.coordinator.soc_watcher_disarm()
 
         # Initialize dynamic export manager if not exists
         if not hasattr(self.coordinator, 'dynamic_export_manager'):
@@ -514,6 +541,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         # Set optimistic values for UI
         self.coordinator.set_optimistic_value("dispatch_start", 1)
         self.coordinator.set_optimistic_value("dispatch_mode", DISPATCH_MODE_DYNAMIC_EXPORT)
+        # Arm the SOC watcher for discharge direction
+        self.coordinator.soc_watcher_arm("discharge")
         await self.coordinator.async_request_refresh()
 
     async def _start_dynamic_import(self):
@@ -523,6 +552,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         # Stop dynamic export if running
         if hasattr(self.coordinator, 'dynamic_export_manager'):
             await self.coordinator.dynamic_export_manager.stop()
+        # Clear any force charge/discharge intent — dynamic modes manage their own SOC guards
+        self.coordinator.soc_watcher_disarm()
 
         # Initialize dynamic import manager if not exists
         if not hasattr(self.coordinator, 'dynamic_import_manager'):
@@ -543,6 +574,8 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
         # Set optimistic values for UI
         self.coordinator.set_optimistic_value("dispatch_start", 1)
         self.coordinator.set_optimistic_value("dispatch_mode", DISPATCH_MODE_DYNAMIC_IMPORT)
+        # Arm the SOC watcher for charge direction
+        self.coordinator.soc_watcher_arm("charge")
         await self.coordinator.async_request_refresh()
 
     async def _start_no_battery_charge(self):
@@ -552,6 +585,7 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.dynamic_export_manager.stop()
         if hasattr(self.coordinator, 'dynamic_import_manager'):
             await self.coordinator.dynamic_import_manager.stop()
+        self.coordinator.soc_watcher_disarm()
 
         _duration, duration_default, duration_reason = safe_get_by_unique_id(
             self._hass,
@@ -611,6 +645,7 @@ class NeovoltDispatchModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.dynamic_export_manager.stop()
         if hasattr(self.coordinator, 'dynamic_import_manager'):
             await self.coordinator.dynamic_import_manager.stop()
+        self.coordinator.soc_watcher_disarm()
 
         _duration, duration_default, duration_reason = safe_get_by_unique_id(
             self._hass,

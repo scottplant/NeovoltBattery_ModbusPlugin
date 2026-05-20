@@ -262,6 +262,15 @@ class NeovoltNumber(CoordinatorEntity, NumberEntity):
                 # Store locally for force charge/discharge settings
                 _LOGGER.debug(f"Setting local value for {self._key}: {value}")
                 self._local_value = value
+
+                # Persist dispatch SOC targets so the SOC watcher survives HA reboots
+                if self._key == "dispatch_charge_soc":
+                    self.coordinator._dispatch_charge_soc = float(value)
+                    self.coordinator._save_persistent_data()
+                elif self._key == "dispatch_discharge_soc":
+                    self.coordinator._dispatch_discharge_soc = float(value)
+                    self.coordinator._save_persistent_data()
+
                 self.async_write_ha_state()
         except Exception as e:
             _LOGGER.error(f"Failed to set {self._key}: {e}")

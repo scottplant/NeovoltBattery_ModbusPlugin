@@ -100,6 +100,11 @@ STORAGE_LAST_RESET_DATE = "last_reset_date"
 STORAGE_MIDNIGHT_BASELINE = "pv_inverter_energy_at_midnight"
 STORAGE_LAST_KNOWN_TOTAL = "last_known_total_energy"
 STORAGE_DAILY_PRESERVED = "daily_energy_before_unavailable"
+# Persisted dispatch SOC targets — survive HA reboots so the watcher can
+# re-arm correctly without needing the number entities to have been written
+# again after restart.
+STORAGE_DISPATCH_CHARGE_SOC = "dispatch_charge_soc"
+STORAGE_DISPATCH_DISCHARGE_SOC = "dispatch_discharge_soc"
 
 
 @dataclass

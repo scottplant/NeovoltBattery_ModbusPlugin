@@ -40,6 +40,19 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Imported here (not at top-level) to avoid circular import at module load time.
+# Both managers call this at runtime, well after all modules are initialised.
+def _safe_get_by_unique_id(hass: HomeAssistant, unique_id: str, default: float) -> float:
+    """Look up a number entity by unique_id and return its float value.
+
+    Delegates to select.safe_get_by_unique_id which uses the entity registry
+    rather than a generated entity_id string, making it robust to any device
+    naming or slugification the user may have chosen.
+    """
+    from .select import safe_get_by_unique_id
+    value, _, _ = safe_get_by_unique_id(hass, unique_id, default)
+    return value
+
 
 def safe_get_entity_float(hass: HomeAssistant, entity_id: str, default: float) -> float:
     """
@@ -151,10 +164,10 @@ class DynamicExportManager:
             _LOGGER.warning("Dynamic Export already running")
             return
 
-        # Get duration from number entity
-        duration_minutes = int(safe_get_entity_float(
+        # Get duration from number entity (unique_id lookup — robust to device naming)
+        duration_minutes = int(_safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dispatch_duration",
+            f"neovolt_{self._device_name}_dispatch_duration",
             120.0,
         ))
 
@@ -265,34 +278,19 @@ class DynamicExportManager:
         """
         data = self._coordinator.data
 
-        # Get target export from number entity
-        target_export_kw = safe_get_entity_float(
+        # Get target export from number entity (unique_id lookup — robust to device naming)
+        target_export_kw = _safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dynamic_mode_power_target",
+            f"neovolt_{self._device_name}_dynamic_mode_power_target",
             1.0,
         )
 
-        # Get discharge SOC cutoff
-        soc_cutoff = int(safe_get_entity_float(
+        # Get discharge SOC cutoff (unique_id lookup — robust to device naming)
+        soc_cutoff = int(_safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dispatch_discharge_soc",
+            f"neovolt_{self._device_name}_dispatch_discharge_soc",
             10.0,
         ))
-
-        # ── SOC guard — pause discharge at cutoff, let inverter's Para5 ceiling handle it ──
-        # We send a standby command (0W, dispatch active) rather than stopping the loop.
-        # The inverter firmware enforces the SOC floor via Para5 independently, so even
-        # if the loop keeps running, no harmful discharge will occur.
-        # We do NOT reset _last_update_time here so the settle timer is not disturbed.
-        current_soc = data.get(COMBINED_BATTERY_SOC) or data.get("battery_soc")
-        if current_soc is not None and current_soc <= soc_cutoff:
-            _LOGGER.info(
-                f"Dynamic Export: SOC {current_soc:.1f}% at or below "
-                f"cutoff {soc_cutoff}% — sending standby command"
-            )
-            await self._send_standby_command(soc_cutoff)
-            self._last_commanded_power_kw = 0.0
-            return
 
         # ── Grid power (signed, W) ────────────────────────────────────────────
         # Authoritative system-wide net power — incorporates all inverters,
@@ -399,7 +397,7 @@ class DynamicExportManager:
                 f"Dynamic Export: Within tolerance "
                 f"(Grid={grid_power_w/1000:.2f}kW, Target={target_export_kw:.2f}kW)"
             )
-            await self._send_standby_command(soc_cutoff)
+            await self._send_standby_command()
             self._last_commanded_power_kw = 0.0
 
         self._last_update_time = now
@@ -407,12 +405,14 @@ class DynamicExportManager:
     async def _send_discharge_command(self, power_kw: float, soc_cutoff: int) -> None:
         """Send force discharge command to inverter.
 
-        Args:
-            power_kw: Discharge power in kW
-            soc_cutoff: SOC cutoff percentage (0-100)
+        Para5 is the system safety floor only (discharging_cutoff_soc register).
+        The user's dispatch target is managed by DispatchSocWatcher in HA.
         """
         power_watts = int(power_kw * 1000)
-        soc_value = soc_percent_to_register(soc_cutoff)
+
+        # Safety floor from inverter's own discharging_cutoff_soc register
+        safety_floor = self._coordinator.data.get("discharging_cutoff_soc", 10) if self._coordinator.data else 10
+        soc_value = soc_percent_to_register(safety_floor)
 
         # Build dispatch command for force discharge
         timeout_seconds = 600  # 10 minutes
@@ -448,12 +448,14 @@ class DynamicExportManager:
     async def _send_charge_command(self, power_kw: float, soc_target: int) -> None:
         """Send force charge command to inverter.
 
-        Args:
-            power_kw: Charge power in kW
-            soc_target: SOC target percentage (0-100)
+        Para5 is the system safety ceiling only (charging_cutoff_soc register).
+        The user's dispatch target is managed by DispatchSocWatcher in HA.
         """
         power_watts = int(power_kw * 1000)
-        soc_value = soc_percent_to_register(soc_target)
+
+        # Safety ceiling from inverter's own charging_cutoff_soc register
+        safety_ceiling = self._coordinator.data.get("charging_cutoff_soc", 100) if self._coordinator.data else 100
+        soc_value = soc_percent_to_register(safety_ceiling)
 
         # Build dispatch command for force charge
         timeout_seconds = 600  # 10 minutes
@@ -489,12 +491,10 @@ class DynamicExportManager:
     async def _send_standby_command(self, soc_limit: int = 0) -> None:
         """Send standby command (dispatch start=1 but power=0) to keep mode active.
 
-        Args:
-            soc_limit: SOC cutoff percentage (0-100) to encode into Para5.
-                       Always pass the discharge cutoff so the inverter never
-                       discharges below the floor even when commanding 0W.
+        Para5 uses the system safety floor from the discharging_cutoff_soc register.
         """
-        soc_value = soc_percent_to_register(soc_limit)
+        safety_floor = self._coordinator.data.get("discharging_cutoff_soc", 10) if self._coordinator.data else 10
+        soc_value = soc_percent_to_register(safety_floor)
         try:
             # Keep dispatch active but with 0W command
             values = [
@@ -526,9 +526,9 @@ class DynamicExportManager:
     async def _stop_and_reset_dispatch(self) -> None:
         """Stop dispatch, reset to Normal mode, and exit Dynamic Export."""
         from .const import DISPATCH_RESET_VALUES
-        
-        _LOGGER.info("Dynamic Export duration expired - resetting to Normal mode")
-        
+
+        _LOGGER.info("Dynamic Export: resetting to Normal mode")
+
         try:
             await self._hass.async_add_executor_job(
                 self._client.write_registers, 0x0880, DISPATCH_RESET_VALUES
@@ -621,9 +621,9 @@ class DynamicImportManager:
             _LOGGER.warning("Dynamic Import already running")
             return
 
-        duration_minutes = int(safe_get_entity_float(
+        duration_minutes = int(_safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dispatch_duration",
+            f"neovolt_{self._device_name}_dispatch_duration",
             120.0,
         ))
 
@@ -731,34 +731,19 @@ class DynamicImportManager:
         """
         data = self._coordinator.data
 
-        # Get target import power (kW) from the shared number entity
-        target_import_kw = safe_get_entity_float(
+        # Get target import power (kW) from the shared number entity (unique_id lookup)
+        target_import_kw = _safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dynamic_mode_power_target",
+            f"neovolt_{self._device_name}_dynamic_mode_power_target",
             1.0,
         )
 
-        # Get charge SOC ceiling from the Dispatch Charge Target SOC entity
-        soc_target = int(safe_get_entity_float(
+        # Get charge SOC ceiling from the Dispatch Charge Target SOC entity (unique_id lookup)
+        soc_target = int(_safe_get_by_unique_id(
             self._hass,
-            f"number.neovolt_{self._device_name}_dispatch_charge_soc",
+            f"neovolt_{self._device_name}_dispatch_charge_soc",
             100.0,
         ))
-
-        # ── SOC guard — pause charging at target, let inverter's Para5 ceiling handle it ──
-        # We send a standby command (0W, dispatch active) rather than stopping the loop.
-        # The inverter firmware enforces the SOC ceiling via Para5 = 255 independently,
-        # so even if the loop keeps running, no overcharge will occur.
-        # We do NOT reset _last_update_time here so the settle timer is not disturbed.
-        current_soc = data.get(COMBINED_BATTERY_SOC) or data.get("battery_soc")
-        if current_soc is not None and current_soc >= soc_target:
-            _LOGGER.info(
-                f"Dynamic Import: SOC {current_soc:.1f}% at or above "
-                f"target {soc_target}% — sending standby command"
-            )
-            await self._send_standby_command(soc_target)
-            self._last_commanded_power_kw = 0.0
-            return
 
         # ── Grid power (signed, W) ────────────────────────────────────────────
         # Authoritative system-wide net power — incorporates all inverters,
@@ -856,9 +841,9 @@ class DynamicImportManager:
                 f"to reduce grid import to target "
                 f"(Grid={grid_power_w/1000:.2f}kW, Target={target_import_kw:.2f}kW)"
             )
-            soc_floor = int(safe_get_entity_float(
+            soc_floor = int(_safe_get_by_unique_id(
                 self._hass,
-                f"number.neovolt_{self._device_name}_dispatch_discharge_soc",
+                f"neovolt_{self._device_name}_dispatch_discharge_soc",
                 10.0,
             ))
             await self._send_discharge_command(discharge_power_kw, soc_floor)
@@ -869,16 +854,21 @@ class DynamicImportManager:
                 f"Dynamic Import: Within tolerance "
                 f"(Grid={grid_power_w/1000:.2f}kW, Target={target_import_kw:.2f}kW)"
             )
-            await self._send_standby_command(soc_target)
+            await self._send_standby_command()
             self._last_commanded_power_kw = 0.0
 
         # Record time of this command for settle timer
         self._last_update_time = now
 
     async def _send_charge_command(self, power_kw: float, soc_target: int) -> None:
-        """Send force charge command to inverter."""
+        """Send force charge command to inverter.
+
+        Para5 is the system safety ceiling only (charging_cutoff_soc register).
+        The user's dispatch target is managed by DispatchSocWatcher in HA.
+        """
         power_watts = int(power_kw * 1000)
-        soc_value = soc_percent_to_register(soc_target)
+        safety_ceiling = self._coordinator.data.get("charging_cutoff_soc", 100) if self._coordinator.data else 100
+        soc_value = soc_percent_to_register(safety_ceiling)
         timeout_seconds = 600  # 10 minutes
 
         values = [
@@ -907,9 +897,14 @@ class DynamicImportManager:
             raise
 
     async def _send_discharge_command(self, power_kw: float, soc_cutoff: int) -> None:
-        """Send force discharge command to counteract PV surplus."""
+        """Send force discharge command to counteract PV surplus.
+
+        Para5 is the system safety floor only (discharging_cutoff_soc register).
+        The user's dispatch target is managed by DispatchSocWatcher in HA.
+        """
         power_watts = int(power_kw * 1000)
-        soc_value = soc_percent_to_register(soc_cutoff)
+        safety_floor = self._coordinator.data.get("discharging_cutoff_soc", 10) if self._coordinator.data else 10
+        soc_value = soc_percent_to_register(safety_floor)
         timeout_seconds = 600
 
         values = [
@@ -940,12 +935,10 @@ class DynamicImportManager:
     async def _send_standby_command(self, soc_limit: int = 100) -> None:
         """Send standby command to keep mode active at 0W.
 
-        Args:
-            soc_limit: SOC target percentage (0-100) to encode into Para5.
-                       Always pass the charge target so the inverter never
-                       charges above the ceiling even when commanding 0W.
+        Para5 uses the system safety ceiling from the charging_cutoff_soc register.
         """
-        soc_value = soc_percent_to_register(soc_limit)
+        safety_ceiling = self._coordinator.data.get("charging_cutoff_soc", 100) if self._coordinator.data else 100
+        soc_value = soc_percent_to_register(safety_ceiling)
         try:
             values = [
                 1,                              # Para1: Dispatch start (keep active)
@@ -974,7 +967,7 @@ class DynamicImportManager:
         """Stop dispatch, reset to Normal mode, and exit Dynamic Import."""
         from .const import DISPATCH_RESET_VALUES
 
-        _LOGGER.info("Dynamic Import duration expired - resetting to Normal mode")
+        _LOGGER.info("Dynamic Import: resetting to Normal mode")
 
         try:
             await self._hass.async_add_executor_job(

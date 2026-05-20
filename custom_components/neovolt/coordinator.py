@@ -41,6 +41,8 @@ from .const import (
     COMBINED_BATTERY_MAX_CELL_T,
     COMBINED_BATTERY_CHARGE_E,
     COMBINED_BATTERY_DISCHARGE_E,
+    STORAGE_DISPATCH_CHARGE_SOC,
+    STORAGE_DISPATCH_DISCHARGE_SOC,
 )
 from .modbus_client import NeovoltModbusClient
 
@@ -234,6 +236,138 @@ class RecoveryManager:
         self.consecutive_failures = 0  # Reset failure counter
 
 
+class DispatchSocWatcher:
+    """Watches combined battery SOC and issues a stop/reset when a user-defined
+    SOC target is reached during an active dispatch mode.
+
+    Design principles
+    -----------------
+    * **HA-managed stop** — the SOC target is NOT baked into the Modbus command
+      (Para5 holds only the system safety floor/ceiling from the inverter's own
+      settings registers).  This means the firmware never silently suspends
+      dispatch: the inverter runs freely, and HA issues an explicit reset when
+      the target is reached.
+    * **Combined SOC** — uses the lower of host/combined for discharge and the
+      higher for charge, so a dual-inverter imbalance can never cause the guard
+      to be missed.
+    * **2-reading confirmation** — the threshold must be met on two consecutive
+      poll cycles before the stop is issued, guarding against transient readings.
+    * **Persistent targets** — charge/discharge SOC targets survive HA reboots
+      via entry.options, so the watcher re-arms correctly after a restart.
+    * **Auto re-arm** — on startup the coordinator checks the live Modbus
+      dispatch registers; if an active discharge/charge mode is detected the
+      watcher arms itself immediately.
+
+    Watched modes
+    -------------
+    Discharge direction (cutoff):  Force Discharge, Dynamic Export
+    Charge direction (target):     Force Charge, Dynamic Import
+    Excluded:                      No Battery Charge, No Battery Discharge (idle modes)
+    """
+
+    # Register values that indicate an active discharge or charge dispatch
+    _DISCHARGE_MODES = frozenset([
+        2,   # DISPATCH_MODE_POWER_WITH_SOC  — used by Force Discharge & Dynamic Export
+        6,   # DISPATCH_MODE_DYNAMIC_EXPORT  — internal marker written by dynamic manager
+    ])
+    _CHARGE_MODES = frozenset([
+        2,   # DISPATCH_MODE_POWER_WITH_SOC  — used by Force Charge
+        7,   # DISPATCH_MODE_DYNAMIC_IMPORT  — internal marker
+    ])
+    # Para2 (dispatch_power) sign convention: positive = discharge, negative = charge
+    # We use this to disambiguate Mode 2 commands.
+
+    # States
+    IDLE = "idle"
+    TRIGGERED = "triggered"   # threshold met once — waiting for confirmation
+    CONFIRMED = "confirmed"   # threshold met twice — issue stop
+
+    def __init__(self) -> None:
+        self._state: str = self.IDLE
+        self._direction: Optional[str] = None  # "discharge" | "charge"
+
+    def arm(self, direction: str) -> None:
+        """Arm the watcher for the given direction."""
+        self._state = self.IDLE
+        self._direction = direction
+        _LOGGER.debug(f"DispatchSocWatcher armed for {direction}")
+
+    def disarm(self) -> None:
+        """Disarm — called when dispatch is stopped or mode changes."""
+        if self._state != self.IDLE or self._direction is not None:
+            _LOGGER.debug("DispatchSocWatcher disarmed")
+        self._state = self.IDLE
+        self._direction = None
+
+    @property
+    def is_armed(self) -> bool:
+        return self._direction is not None
+
+    def evaluate(
+        self,
+        host_soc: Optional[float],
+        combined_soc: Optional[float],
+        charge_target: float,
+        discharge_cutoff: float,
+    ) -> bool:
+        """Evaluate current SOC against target. Returns True when stop should fire.
+
+        Uses the most conservative SOC value in each direction:
+        - Discharge: min(host, combined) — fires as soon as either bank is at floor
+        - Charge:    max(host, combined) — fires as soon as either bank is at ceiling
+        """
+        if not self.is_armed:
+            return False
+
+        if self._direction == "discharge":
+            if host_soc is None and combined_soc is None:
+                return False
+            if host_soc is not None and combined_soc is not None:
+                soc = min(host_soc, combined_soc)
+            else:
+                soc = host_soc if host_soc is not None else combined_soc
+            threshold_met = soc <= (discharge_cutoff + 0.9)
+
+        elif self._direction == "charge":
+            if host_soc is None and combined_soc is None:
+                return False
+            if host_soc is not None and combined_soc is not None:
+                soc = max(host_soc, combined_soc)
+            else:
+                soc = host_soc if host_soc is not None else combined_soc
+            threshold_met = soc >= (charge_target - 0.9)
+
+        else:
+            return False
+
+        if threshold_met:
+            if self._state == self.IDLE:
+                _LOGGER.debug(
+                    f"DispatchSocWatcher: threshold met (direction={self._direction}, "
+                    f"soc={soc:.1f}%, target={charge_target if self._direction == 'charge' else discharge_cutoff}%) "
+                    f"— waiting for confirmation on next poll"
+                )
+                self._state = self.TRIGGERED
+                return False
+            elif self._state == self.TRIGGERED:
+                _LOGGER.info(
+                    f"DispatchSocWatcher: threshold confirmed on 2nd reading "
+                    f"(direction={self._direction}, soc={soc:.1f}%) — issuing stop"
+                )
+                self._state = self.CONFIRMED
+                return True
+        else:
+            # SOC moved away from threshold — reset to IDLE (transient reading guard)
+            if self._state == self.TRIGGERED:
+                _LOGGER.debug(
+                    f"DispatchSocWatcher: threshold no longer met "
+                    f"(soc={soc:.1f}%) — resetting to IDLE (transient reading)"
+                )
+            self._state = self.IDLE
+
+        return False
+
+
 class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching Neovolt data."""
 
@@ -316,8 +450,29 @@ class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
         # written into this coordinator's data dict on every update cycle.
         self.follower_coordinator: "NeovoltDataUpdateCoordinator | None" = None
 
+        # SOC watcher — monitors combined battery SOC and issues a stop/reset
+        # when the user-defined target is reached during an active dispatch mode.
+        # This replaces the old Para5-based firmware stop approach.
+        self._soc_watcher = DispatchSocWatcher()
+
+        # Persisted dispatch SOC targets — loaded from entry.options so they
+        # survive HA reboots and allow the watcher to re-arm correctly.
+        self._dispatch_charge_soc: float = float(
+            options.get(STORAGE_DISPATCH_CHARGE_SOC, 100.0)
+        )
+        self._dispatch_discharge_soc: float = float(
+            options.get(STORAGE_DISPATCH_DISCHARGE_SOC, 10.0)
+        )
+        _LOGGER.debug(
+            f"Loaded persisted dispatch SOC targets: "
+            f"charge={self._dispatch_charge_soc}%, discharge={self._dispatch_discharge_soc}%"
+        )
+
         # Use min_interval as the base coordinator update interval
         update_interval = timedelta(seconds=min_interval)
+
+        # Flag to trigger watcher re-arm on the first successful data fetch
+        self._initial_arm_done: bool = False
 
         super().__init__(
             hass,
@@ -356,6 +511,10 @@ class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
 
         if self._daily_energy_before_unavailable is not None:
             new_options[STORAGE_DAILY_PRESERVED] = self._daily_energy_before_unavailable
+
+        # Save dispatch SOC targets
+        new_options[STORAGE_DISPATCH_CHARGE_SOC] = self._dispatch_charge_soc
+        new_options[STORAGE_DISPATCH_DISCHARGE_SOC] = self._dispatch_discharge_soc
 
         # Schedule the async config entry update on the event loop
         self.hass.async_create_task(
@@ -397,6 +556,14 @@ class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
             
             # Now update timestamp for stale data detection (AFTER data merge)
             self._last_successful_data_time = now
+
+            # Auto-reset dispatch if a force charge/discharge SOC target was reached
+            await self._run_soc_watcher()
+
+            # Re-arm the watcher on first successful data fetch after startup/reboot
+            if not self._initial_arm_done:
+                self._initial_arm_done = True
+                self._rearm_watcher_on_startup()
 
             # Return merged cache to ensure all previously seen keys are available
             # even if some blocks failed to read this cycle
@@ -1191,6 +1358,125 @@ class NeovoltDataUpdateCoordinator(DataUpdateCoordinator):
             return True
         # Have data and timestamp - check 12-hour staleness
         return not self.is_data_stale
+
+    def _rearm_watcher_on_startup(self) -> None:
+        """Re-arm the SOC watcher after a HA restart if a dispatch is already active.
+
+        Reads the live dispatch registers from the first data fetch and arms the
+        watcher in the correct direction if an active charge or discharge mode is
+        detected.  This means the watcher resumes watching without the user
+        needing to re-issue the dispatch command.
+
+        Direction is determined by the sign of dispatch_power (Para2 offset):
+          positive → discharge, negative → charge.
+        Mode 2 (DISPATCH_MODE_POWER_WITH_SOC) is used by both Force Charge and
+        Force Discharge, so power sign is the only reliable differentiator.
+        Dynamic Export and Dynamic Import also use Mode 2 at the control-loop
+        level, so they are treated identically for watcher purposes.
+        """
+        dispatch_start = self._last_known_data.get("dispatch_start", 0)
+        if not dispatch_start:
+            _LOGGER.debug("DispatchSocWatcher: no active dispatch on startup — staying disarmed")
+            return
+
+        dispatch_power = self._last_known_data.get("dispatch_power", 0)
+        dispatch_mode = self._last_known_data.get("dispatch_mode", 0)
+
+        # Modes we watch (excludes no_charge=19, no_discharge=97)
+        watched_modes = {2, 6, 7}  # POWER_WITH_SOC, DYNAMIC_EXPORT, DYNAMIC_IMPORT
+        if dispatch_mode not in watched_modes:
+            _LOGGER.debug(
+                f"DispatchSocWatcher: active dispatch mode {dispatch_mode} is not watched "
+                f"— staying disarmed"
+            )
+            return
+
+        # Determine direction from power sign
+        # dispatch_power is stored as raw offset value: positive=discharge, negative=charge
+        if dispatch_power > 0:
+            direction = "discharge"
+        elif dispatch_power < 0:
+            direction = "charge"
+        else:
+            _LOGGER.debug("DispatchSocWatcher: dispatch_power=0 on startup — cannot determine direction")
+            return
+
+        _LOGGER.info(
+            f"DispatchSocWatcher: re-arming on startup "
+            f"(dispatch_mode={dispatch_mode}, dispatch_power={dispatch_power}, "
+            f"direction={direction}, "
+            f"charge_target={self._dispatch_charge_soc}%, "
+            f"discharge_cutoff={self._dispatch_discharge_soc}%)"
+        )
+        self._soc_watcher.arm(direction)
+
+    async def _run_soc_watcher(self) -> None:
+        """Run the SOC watcher on every data update cycle.
+
+        Evaluates the current combined/host SOC against the persisted dispatch
+        targets. If the watcher confirms the threshold has been met on two
+        consecutive readings, issues DISPATCH_RESET_VALUES to return the
+        inverter to Normal mode — exactly the same command as pressing Stop.
+
+        The watcher is disarmed automatically when:
+        - dispatch_start drops to 0 (inverter cleared it, e.g. duration expired)
+        - A stop/reset is issued by the watcher itself
+        - Any mode change in select.py calls coordinator.soc_watcher_disarm()
+        """
+        if not self._soc_watcher.is_armed:
+            return
+
+        # If the inverter cleared dispatch_start on its own (duration expired,
+        # external reset), disarm and return — no reset command needed.
+        if self._last_known_data.get("dispatch_start", 1) == 0:
+            _LOGGER.debug(
+                "DispatchSocWatcher: dispatch_start cleared by inverter — disarming"
+            )
+            self._soc_watcher.disarm()
+            return
+
+        host_soc = self._last_known_data.get("battery_soc")
+        combined_soc = self._last_known_data.get(COMBINED_BATTERY_SOC)
+
+        should_stop = self._soc_watcher.evaluate(
+            host_soc=host_soc,
+            combined_soc=combined_soc,
+            charge_target=self._dispatch_charge_soc,
+            discharge_cutoff=self._dispatch_discharge_soc,
+        )
+
+        if not should_stop:
+            return
+
+        # Disarm BEFORE the write so a concurrent poll can't re-trigger
+        self._soc_watcher.disarm()
+
+        _LOGGER.info(
+            f"DispatchSocWatcher: issuing stop command "
+            f"(host_soc={host_soc}%, combined_soc={combined_soc}%, "
+            f"charge_target={self._dispatch_charge_soc}%, "
+            f"discharge_cutoff={self._dispatch_discharge_soc}%)"
+        )
+
+        try:
+            from .const import DISPATCH_RESET_VALUES
+            await self.hass.async_add_executor_job(
+                self.client.write_registers, 0x0880, DISPATCH_RESET_VALUES
+            )
+            self.set_optimistic_value("dispatch_start", 0)
+            self.set_optimistic_value("dispatch_power", 0)
+            self.set_optimistic_value("dispatch_mode", 0)
+            _LOGGER.info("DispatchSocWatcher: inverter returned to Normal mode")
+        except Exception as e:
+            _LOGGER.error(f"DispatchSocWatcher: failed to issue stop command: {e}")
+
+    def soc_watcher_arm(self, direction: str) -> None:
+        """Arm the SOC watcher. Called by select.py when a dispatch is started."""
+        self._soc_watcher.arm(direction)
+
+    def soc_watcher_disarm(self) -> None:
+        """Disarm the SOC watcher. Called by select.py on any mode change or stop."""
+        self._soc_watcher.disarm()
 
     def set_optimistic_value(self, key: str, value: Any) -> None:
         """Set a value optimistically after write command.

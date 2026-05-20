@@ -30,6 +30,8 @@ from .const import (
     STORAGE_MIDNIGHT_BASELINE,
     STORAGE_LAST_KNOWN_TOTAL,
     STORAGE_DAILY_PRESERVED,
+    STORAGE_DISPATCH_CHARGE_SOC,
+    STORAGE_DISPATCH_DISCHARGE_SOC,
 )
 from .coordinator import NeovoltDataUpdateCoordinator
 
@@ -216,6 +218,8 @@ async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
         STORAGE_MIDNIGHT_BASELINE,
         STORAGE_LAST_KNOWN_TOTAL,
         STORAGE_DAILY_PRESERVED,
+        STORAGE_DISPATCH_CHARGE_SOC,
+        STORAGE_DISPATCH_DISCHARGE_SOC,
     }
 
     # Get current options
